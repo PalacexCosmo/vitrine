@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Le Palace</title>
+<!--
+  Lecteur de playlist sur mesure, commun à :
+    - prototype/playlist.html : écrans confiserie du Palace (réseau local, /api/playlist/<nom>) ;
+    - vitrine/index.html      : écran du commerçant partenaire (GitHub Pages, ./ecrans/<nom>.json).
+  FICHIER GÉNÉRÉ, ne pas modifier à la main. Les deux fichiers sont générés depuis prototype/lecteur-source.html par prototype/generer-lecteurs.py :
+  modifier la source, puis relancer le script.
+
+  Éléments (servis par serveur/playlists.js) :
+    { type: "image", media, duree }                 image plein écran, jamais recadrée, pendant duree s
+    { type: "video", media, duree, titre?, bientot? } vidéo sans le son ; duree 0 = jouée en entier, sinon coupée
+    { type: "film", titre, affiche, dureeFilm, classification, seances: [{ debut, version, salle }], duree }
+    { type: "seances", seances: [{ titre, debut, version, salle }], duree }   prochaines séances (7 lignes)
+    { type: "semaine", films: [{ titre, affiche?, seances: [{ debut, version, salle }] }], duree }
+                                                   programme de la semaine : une ligne par film, 7 jours à partir
+                                                   d'aujourd'hui ; plusieurs pages si besoin, qui se partagent duree
+  Programmation, facultative sur chaque élément, appliquée à l'heure de l'écran (même règle que Playlists.programme) :
+    actif:false, dateDebut / dateFin "AAAA-MM-JJ", jours [1..7] (1 = lundi), heureDebut / heureFin "HH:MM"
+    (heureFin avant heureDebut : le créneau passe minuit).
+
+  Compatibilité vieux navigateurs Samsung (WebKit série D, Tizen 2.4) : ES5, ni var(), flex, gap, inset, object-fit
+  ni calc ; tout est dessiné sur une scène fixe de 1920x1080 px réduite par -webkit-transform: scale().
+  Les vidéos sont hors de la scène (les vieux lecteurs gèrent mal les transformations). Heures des séances lues
+  dans la chaîne debut (HH:MM), jamais via le fuseau de l'écran.
+
+  Paramètres d'URL :
+    ?ecran=<nom>     nom de l'écran (obligatoire)
+    &demo=1          playlist de démonstration
+    &cinema=cosmo    charte Cosmo (sinon le champ « cinema » du fichier, sinon Palace)
+    &orientation=portrait|paysage  (sinon déduite de l'écran : plus haut que large = portrait, scène 1080x1920)
+    &maintenant=…    (essais) fige l'heure de l'écran, ex. 2026-11-05T13:20:00+01:00
+-->
+<style>
+  @font-face { font-family: 'Afacad'; font-weight: 400; src: url('polices/Afacad-400.ttf') format('truetype'); }
+  @font-face { font-family: 'Afacad'; font-weight: 600; src: url('polices/Afacad-600.ttf') format('truetype'); }
+  @font-face { font-family: 'Afacad'; font-weight: 700; src: url('polices/Afacad-700.ttf') format('truetype'); }
+  @font-face { font-family: 'Pathway Gothic One'; font-weight: 400; src: url('polices/PathwayGothicOne-400.ttf') format('truetype'); }
+
+  /* Proportions au nombre d'or (φ = 1,618), écran 1920x1080 (L x H), comme l'écran caisse.
+     Longueurs de la suite  H/φ = 667 · H/φ² = 413 · H/φ³ = 255 · H/φ⁴ = 158 · H/φ⁵ = 97 · H/φ⁶ = 60 · H/φ⁷ = 37
+                            L/φ = 1187 · L/φ² = 733 · L/φ³ = 453 · L/φ⁴ = 280 · L/φ⁵ = 173 · L/φ⁶ = 107 · L/φ⁷ = 66
+     Textes : 189 · 117 · 72 · 44 · 28 px (chaque taille = la précédente / φ)
+     Espaces : 13 · 20 · 32 · 52 · 85 px (×φ)
+     Fiche film : affiche L/φ² | infos L/φ ; marge de l'affiche H/φ⁷.
+     Prochaines séances : marges L/φ⁷ et H/φ⁶ ; en-tête jusqu'à H/φ³ ; 5 lignes de H/φ⁴ ;
+                          colonnes accès L/φ³ · heure L/φ⁴ · salle L/φ⁵ · film le reste.
+     Semaine : en-tête jusqu'à H/φ³ ; colonne film L/φ³ ; lignes H/φ⁵ ; en-têtes de jours H/φ⁶. */
+  * { -webkit-box-sizing: border-box; box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; cursor: none; background: #000; color: #F4F2EC; }
+  body { font-family: 'Afacad', 'Helvetica Neue', Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+  .scene { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; overflow: hidden; background: #000;
+    -webkit-transform-origin: 0 0; transform-origin: 0 0; }
+  .titre, .heures, .attente b, .placeholder span, .ligne .h, .ligne .t, .ligne .s b, .tableau h1, .bandeau .texte, .demo-visuel b { font-family: 'Pathway Gothic One', 'Afacad', 'Arial Narrow', sans-serif; font-weight: 400; }
+
+  /* Couches : une par élément, fondu enchaîné */
+  .couche { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; overflow: hidden; background: #131316; opacity: 0;
+    -webkit-transition: opacity .8s; transition: opacity .8s; }
+  .couche.noir { background: #000; }
+  .couche.visible { opacity: 1; }
+  .couche .media { position: absolute; }
+
+  /* Fiche film */
+  .fond { position: absolute; top: -65px; left: -65px; width: 2050px; height: 1113px; background-position: center; background-repeat: no-repeat;
+    -webkit-background-size: cover; background-size: cover;
+    -webkit-filter: blur(48px) saturate(1.15) brightness(.7); filter: blur(48px) saturate(1.15) brightness(.7); }
+  .voile { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; background: rgba(19,19,22,.6);
+    background: -webkit-linear-gradient(left, rgba(19,19,22,.05) 15%, rgba(19,19,22,.6) 45%, rgba(19,19,22,.88) 100%);
+    background: linear-gradient(90deg, rgba(19,19,22,.05) 15%, rgba(19,19,22,.6) 45%, rgba(19,19,22,.88) 100%); }
+  .affiche { position: absolute; top: 0; left: 0; width: 733px; height: 1080px; }
+  .affiche img { position: absolute; -webkit-box-shadow: 0 13px 40px rgba(0,0,0,.6); box-shadow: 0 13px 40px rgba(0,0,0,.6); }
+  .placeholder { position: absolute; top: 37px; left: 31px; width: 670px; height: 1005px; display: table; table-layout: fixed; background: #1C1C20; border-top: 6px solid #C12C57; }
+  .placeholder span { display: table-cell; vertical-align: middle; padding: 52px; text-align: center; text-transform: uppercase; letter-spacing: .06em; font-size: 96px; line-height: 1.05; word-wrap: break-word; }
+  .infos { position: absolute; top: 0; left: 733px; width: 1187px; height: 1080px; display: table; table-layout: fixed; }
+  .infos .centre { display: table-cell; vertical-align: middle; padding: 52px 85px 52px 52px; }
+  .rubrique { font-size: 28px; line-height: 1; font-weight: 600; color: #DA5A7E; text-transform: uppercase; letter-spacing: .2em; }
+  .filet { width: 107px; height: 6px; background: #C12C57; margin: 20px 0 32px; }
+  .titre { text-transform: uppercase; letter-spacing: .06em; font-size: 117px; line-height: 1.02; word-wrap: break-word; }
+  .details { margin-top: 20px; font-size: 44px; line-height: 1.2; color: #B8B6AE; }
+  .details span { display: inline-block; vertical-align: middle; margin-right: 20px; }
+  .badge { font-size: 28px; font-weight: 700; letter-spacing: .08em; padding: 2px 12px; border-radius: 4px; border: 2px solid #DA5A7E; color: #DA5A7E; }
+  .jours { margin-top: 52px; }
+  .jour { margin-top: 20px; }
+  .jour .lib { display: block; font-size: 28px; line-height: 1.2; font-weight: 600; color: #DA5A7E; text-transform: uppercase; letter-spacing: .14em; }
+  .heures { display: block; margin-top: 4px; font-size: 72px; line-height: 1.05; letter-spacing: .02em; }
+  .heures span { display: inline-block; margin-right: 52px; white-space: nowrap; }
+  .heures em, .ligne em { font-style: normal; font-family: 'Afacad', Arial, sans-serif; font-size: 28px; font-weight: 700; letter-spacing: .08em; color: #B8B6AE; margin-left: 13px; vertical-align: 32px; }
+
+  /* Prochaines séances : une ligne par salle, 5 au plus, avec voyant d'accès (couleur + texte) */
+  .tableau { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; padding: 60px 66px 0; }
+  .tableau .filet { margin: 20px 0 0; }
+  .entetes { position: absolute; top: 203px; left: 66px; height: 52px; line-height: 52px; font-size: 28px; font-weight: 600; color: #8A8880; text-transform: uppercase; letter-spacing: .2em; white-space: nowrap; }
+  .entetes span { display: inline-block; }
+  .lignes { position: absolute; top: 255px; left: 66px; width: 1788px; }
+  .ligne { position: relative; height: 158px; border-top: 1px solid #2A2A30; white-space: nowrap; overflow: hidden; }
+  .ligne > span { display: inline-block; height: 158px; line-height: 158px; vertical-align: top; }
+  .ligne .v, .entetes .v { width: 453px; }
+  .ligne .v i { display: inline-block; width: 60px; height: 60px; border-radius: 50%; vertical-align: middle; margin: 0 32px 0 13px; }
+  .ligne .v span { display: inline-block; vertical-align: middle; line-height: 1; font-size: 44px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+  .ligne .v small { display: block; margin-top: 13px; font-size: 28px; font-weight: 600; letter-spacing: .03em; text-transform: none; color: #B8B6AE; }
+  .ligne.acces-ouvert .v i { background: #3FD07F; -webkit-box-shadow: 0 0 37px rgba(63,208,127,.7); box-shadow: 0 0 37px rgba(63,208,127,.7); }
+  .ligne.acces-ouvert .v span { color: #3FD07F; }
+  .ligne.acces-ferme .v i { background: #E5484D; -webkit-box-shadow: 0 0 32px rgba(229,72,77,.55); box-shadow: 0 0 32px rgba(229,72,77,.55); }
+  .ligne.acces-ferme .v span { color: #FF6B70; }
+  .ligne.acces-ouvert { background: rgba(63,208,127,.10); }
+  .ligne .h, .entetes .h { width: 280px; }
+  .ligne .h { font-size: 117px; letter-spacing: .02em; }
+  .ligne .s, .entetes .s { width: 173px; }
+  .ligne .s b { display: inline-block; width: 97px; height: 97px; line-height: 101px; text-align: center; border-radius: 8px; background: #C12C57; color: #FFF; font-size: 72px; font-weight: 400; vertical-align: middle; }
+  .ligne .t { max-width: 800px; overflow: hidden; text-overflow: ellipsis; font-size: 72px; text-transform: uppercase; letter-spacing: .05em; }
+  .ligne em { display: inline-block; vertical-align: top; margin-top: 44px; }
+
+  /* Programme de la semaine : films en lignes, 7 jours en colonnes (aujourd'hui en premier, surligné) */
+  .semaine { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; padding: 60px 66px 0; }
+  .semaine .filet { margin: 20px 0 20px; }
+  .semaine h1 { font-family: 'Pathway Gothic One', Arial, sans-serif; font-weight: 400; text-transform: uppercase; letter-spacing: .06em; font-size: 72px; line-height: 1; white-space: nowrap; }
+  .semaine .page { position: absolute; top: 60px; right: 66px; font-size: 28px; color: #8A8880; letter-spacing: .1em; }
+  .grille { position: absolute; top: 255px; left: 66px; width: 1788px; border-collapse: collapse; table-layout: fixed; }
+  .grille th { height: 60px; font-size: 20px; font-weight: 600; color: #B8B6AE; text-transform: uppercase; letter-spacing: .14em; text-align: center; vertical-align: middle; line-height: 1; }
+  .grille th b { display: block; margin-top: 4px; font-family: 'Pathway Gothic One', Arial, sans-serif; font-weight: 400; font-size: 28px; letter-spacing: .04em; color: #F4F2EC; }
+  .grille th.film { text-align: left; }
+  .grille td { height: 97px; border-top: 1px solid #2A2A30; text-align: center; vertical-align: middle; font-family: 'Pathway Gothic One', Arial, sans-serif; font-size: 36px; line-height: 42px; letter-spacing: .02em; }
+  .grille td .c { max-height: 84px; overflow: hidden; }   /* 2 lignes d'horaires au plus */
+  .grille td.film { text-align: left; white-space: nowrap; overflow: hidden; }
+  .grille td.film img { display: inline-block; width: 47px; height: 71px; vertical-align: middle; margin-right: 20px; }
+  .grille td.film span { display: inline-block; max-width: 370px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; font-size: 44px; text-transform: uppercase; letter-spacing: .05em; }
+  .grille td span.h { display: inline-block; margin: 0 6px; white-space: nowrap; }
+  .grille td span.h.passee { opacity: .3; }
+  .grille td span.h i { font-style: normal; font-family: 'Afacad', Arial, sans-serif; font-size: 17px; font-weight: 700; color: #B8B6AE; margin-left: 2px; position: relative; top: -14px; line-height: 0; vertical-align: baseline; }   /* exposant sans agrandir la ligne */
+  .grille .auj { background: rgba(193,44,87,.16); }
+  .grille th.auj { border-top: 6px solid #C12C57; letter-spacing: .04em; }
+
+  /* Logo du cinéma en filigrane, en bas à droite (pas de bandeau : tout l'écran sert au contenu) */
+  .filigrane { position: absolute; right: -97px; bottom: -97px; width: 667px; height: auto; opacity: .06; }
+
+  /* Écran d'attente : rien de programmé à cette heure */
+  .attente { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; display: table; background: #000; }
+  .attente div { display: table-cell; vertical-align: middle; text-align: center; }
+  .attente img { width: 380px; height: auto; opacity: .5; }
+  .attente b { display: block; margin-top: 40px; text-transform: uppercase; letter-spacing: .06em; font-size: 52px; color: #8A8880; }
+
+  /* Visuels de démonstration (admin) */
+  .demo-visuel { position: absolute; top: 0; left: 0; width: 1920px; height: 1080px; display: table; text-align: center; }
+  .demo-visuel div { display: table-cell; vertical-align: middle; padding: 115px; }
+  .demo-visuel b { display: block; text-transform: uppercase; letter-spacing: .06em; font-size: 192px; line-height: 1; }
+  .demo-visuel span { display: block; margin-top: 27px; font-size: 54px; font-weight: 600; }
+
+  /* Charte Cosmo : noir cinéma, or moutarde, ambre */
+  .cosmo .couche, .cosmo .scene { background: #0E0E10; }
+  .cosmo .rubrique, .cosmo .jour .lib { color: #F0B660; }
+  .cosmo .filet, .cosmo .ligne .s b { background: #CFA94E; }
+  .cosmo .ligne .s b { color: #241A06; }
+  .cosmo .grille .auj { background: rgba(207,169,78,.14); }
+  .cosmo .grille th.auj { border-top-color: #CFA94E; }
+  .cosmo .badge { border-color: #F0B660; color: #F0B660; }
+  .cosmo .placeholder { border-top-color: #CFA94E; }
+  .cosmo #video-zone .legende b { color: #F0B660; }
+
+
+  /* ===== Écran en portrait (1080x1920), détecté automatiquement ou forcé par &orientation=portrait =====
+     Suite du nombre d'or :  L/φ = 667 · 413 · 255 · 158 · 97 · 60 · 37   (L = 1080)
+                             H/φ = 1187 · 733 · 453 · 280 · 173 · 107 · 66 (H = 1920)
+     Marges L/φ⁶ (60) et H/φ⁷ (66). */
+  .portrait .scene, .portrait .couche, .portrait .voile, .portrait .attente, .portrait .demo-visuel { width: 1080px; height: 1920px; }
+  /* Fiche film : affiche en haut jusqu'à H/φ, infos dessous sur H/φ² */
+  .portrait .fond { width: 1210px; height: 2050px; }
+  .portrait .voile { background: rgba(19,19,22,.6);
+    background: -webkit-linear-gradient(top, rgba(19,19,22,.05) 20%, rgba(19,19,22,.6) 55%, rgba(19,19,22,.92) 75%);
+    background: linear-gradient(180deg, rgba(19,19,22,.05) 20%, rgba(19,19,22,.6) 55%, rgba(19,19,22,.92) 75%); }
+  .portrait .affiche { width: 1080px; height: 1187px; }
+  .portrait .placeholder { top: 66px; left: 179px; width: 723px; height: 1084px; }
+  .portrait .infos { top: 1187px; left: 0; width: 1080px; height: 733px; }
+  .portrait .infos .centre { vertical-align: top; padding: 37px 60px 66px; }
+  .portrait .jours { margin-top: 32px; }
+  /* Prochaines séances : 5 lignes de H/φ⁴ ; voyant en haut de ligne, heure + salle + film dessous */
+  .portrait .tableau { width: 1080px; height: 1920px; padding: 66px 60px 0; }
+  .portrait .entetes { display: none; }
+  .portrait .lignes { top: 453px; left: 60px; width: 960px; }
+  .portrait .ligne { height: 280px; }
+  .portrait .ligne > span { position: absolute; height: auto; line-height: 1; }
+  .portrait .ligne .v { top: 32px; left: 0; width: 960px; }
+  .portrait .ligne .v i { margin: 0 32px 0 0; }
+  .portrait .ligne .v small { display: inline; margin: 0 0 0 20px; }
+  .portrait .ligne .h { top: 130px; left: 0; width: 280px; }
+  .portrait .ligne .s { top: 140px; left: 280px; width: 130px; }
+  .portrait .ligne .t { top: 152px; left: 413px; width: 547px; max-width: 547px; }
+  .portrait .ligne em { position: absolute; top: 236px; left: 413px; margin: 0; vertical-align: baseline; }
+  /* Programme de la semaine : une page par jour, 8 films au plus par page */
+  .semp { position: absolute; top: 0; left: 0; width: 1080px; height: 1920px; padding: 66px 60px 0; }
+  .semp .filet { margin: 20px 0 32px; }
+  .semp h1 { font-family: 'Pathway Gothic One', Arial, sans-serif; font-weight: 400; text-transform: uppercase; letter-spacing: .04em; font-size: 117px; line-height: 1; white-space: nowrap; overflow: hidden; }
+  .semp .page { position: absolute; top: 66px; right: 60px; font-size: 28px; line-height: 1; color: #8A8880; letter-spacing: .1em; }
+  .jours7 { position: absolute; top: 300px; left: 60px; width: 960px; height: 107px; white-space: nowrap; font-size: 0; }
+  .jours7 span { display: inline-block; width: 137px; height: 107px; vertical-align: top; text-align: center; padding-top: 13px; border-top: 6px solid #2A2A30;
+    font-size: 28px; line-height: 1; font-weight: 600; color: #8A8880; text-transform: uppercase; letter-spacing: .14em; }
+  .jours7 span b { display: block; margin-top: 8px; font-family: 'Pathway Gothic One', Arial, sans-serif; font-weight: 400; font-size: 44px; letter-spacing: .02em; color: #8A8880; }
+  .jours7 span.actif { border-top-color: #C12C57; color: #F4F2EC; }
+  .jours7 span.actif b { color: #F4F2EC; }
+  .films { position: absolute; top: 453px; left: 60px; width: 960px; }
+  .fl { position: relative; height: 173px; border-top: 1px solid #2A2A30; }
+  .fl img, .fl .vide { position: absolute; top: 13px; left: 0; width: 97px; height: 146px; background: #1C1C20; }
+  .fl .ft, .fl .fh { position: absolute; left: 134px; width: 826px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-family: 'Pathway Gothic One', Arial, sans-serif; font-weight: 400; line-height: 1; }
+  .fl .ft { top: 26px; font-size: 72px; text-transform: uppercase; letter-spacing: .05em; }
+  .fl .fh { top: 110px; font-size: 44px; letter-spacing: .03em; color: #DA5A7E; }
+  .fl .fh span { margin-right: 37px; }
+  .fl .fh span.passee { opacity: .3; }
+  .fl .fh i { font-style: normal; font-family: 'Afacad', Arial, sans-serif; font-size: 20px; font-weight: 700; letter-spacing: .08em; color: #B8B6AE; margin-left: 6px; position: relative; top: -16px; line-height: 0; }
+  .semp .rien { position: absolute; top: 453px; left: 60px; font-size: 44px; color: #8A8880; }
+  .cosmo .jours7 span.actif { border-top-color: #CFA94E; }
+  .cosmo .fl .fh { color: #F0B660; }
+
+  /* Vidéo : hors de la scène, plein écran */
+  #video-zone { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #000; display: none; z-index: 10; }
+  #video-zone video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #000; }
+  #video-zone .legende { position: absolute; left: 0; bottom: 0; width: 100%; padding: 0 3% 2.5%; color: #FFF; font-family: 'Pathway Gothic One', Arial, sans-serif; text-transform: uppercase; letter-spacing: .06em; text-shadow: 0 2px 12px rgba(0,0,0,.9); }
+  #video-zone .legende b { font-weight: 400; color: #FF8FB0; }
+</style>
+</head>
+<body>
+<div class="scene" id="scene"></div>
+<div id="video-zone"><video id="video" muted playsinline preload="auto"></video><div class="legende" id="legende"></div></div>
+
+<script>
+(function () {
+  'use strict';
+  var MODE = 'vitrine';                       // 'local' (serveur du cinéma) ou 'vitrine' (GitHub Pages)
+  var MARQUES = {
+    palace: { logo: 'marques/palace-logo-blanc.png', filigrane: 'marques/palace-heritage-mark-white.png' },
+    cosmo: { logo: 'marques/cosmo-heritage-white-tight.png', filigrane: 'marques/cosmo-heritage-c-white.png' }
+  };
+  var marque = 'palace', LOGO = MARQUES.palace.logo;
+  function choisirMarque(c) {
+    c = c === 'cosmo' ? 'cosmo' : 'palace';
+    if (c === marque && LOGO) return;
+    marque = c; LOGO = MARQUES[c].logo;
+    classes();
+  }
+  // Orientation : &orientation=portrait|paysage, sinon déduite de l'écran (plus haut que large = portrait)
+  var PORTRAIT = false, SW = 1920, SH = 1080;
+  function classes() {
+    document.documentElement.className = (marque === 'cosmo' ? 'cosmo' : '') + (PORTRAIT ? ' portrait' : '');
+  }
+  var params = {};
+  location.search.replace(/^\?/, '').split('&').forEach(function (kv) {
+    if (!kv) return;
+    var p = kv.split('=');
+    params[decodeURIComponent(p[0])] = decodeURIComponent((p[1] || '').replace(/\+/g, ' '));
+  });
+  var nom = /^[\w-]+$/.test(params.ecran || '') ? params.ecran : '';
+  if (params.cinema) choisirMarque(params.cinema);
+  var demo = params.demo === '1' || (MODE === 'local' && !/^http/.test(location.protocol));
+  var DECALAGE = 0;
+  if (params.maintenant) { var lu = lire(params.maintenant); if (lu) DECALAGE = lu.t - Date.now(); }
+  function maint() { return Date.now() + DECALAGE; }
+  var config = {
+    source: MODE === 'vitrine' ? 'ecrans/' + nom + '.json' : '/api/playlist/' + nom,
+    relecture: MODE === 'vitrine' ? 15 * 60 * 1000 : 60 * 1000,
+    joursMax: 3,
+    lignesMax: 7,
+    videoDemarrageMax: 15 * 1000,   // une vidéo qui ne démarre pas en 15 s est sautée
+    videoDureeMax: 10 * 60 * 1000   // garde-fou pour une vidéo jouée en entier
+  };
+  function $(id) { return document.getElementById(id); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+  // ---------- Scène fixe 1920x1080 (1080x1920 en portrait) réduite à la taille réelle de l'écran
+  function echelle() {
+    var l = window.innerWidth || document.documentElement.clientWidth, h = window.innerHeight || document.documentElement.clientHeight;
+    PORTRAIT = params.orientation === 'portrait' || (params.orientation !== 'paysage' && h > l);
+    SW = PORTRAIT ? 1080 : 1920; SH = PORTRAIT ? 1920 : 1080; classes();
+    var k = Math.min(l / SW, h / SH), st = $('scene').style;
+    st.webkitTransform = st.transform = 'scale(' + k + ')';
+    st.left = Math.round((l - SW * k) / 2) + 'px'; st.top = Math.round((h - SH * k) / 2) + 'px';
+    $('legende').style.fontSize = Math.round(h * 0.055) + 'px';
+  }
+  echelle();
+  window.addEventListener('resize', echelle, false);
+  var test = document.createElement('div').style;
+  var FLOU = 'webkitFilter' in test || !!(window.CSS && CSS.supports && CSS.supports('filter', 'blur(1px)'));
+
+  // ---------- Dates des séances : lues dans la chaîne « 2026-11-05T14:00:00+01:00 » (Date.parse non fiable sur vieux WebKit)
+  function lire(iso) {
+    var m = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)(?::(\d\d))?(?:\.\d+)?(Z|([+-])(\d\d):?(\d\d))?/.exec(String(iso || ''));
+    if (!m) return null;
+    var off = m[7] && m[7] !== 'Z' ? (m[8] === '-' ? -1 : 1) * (Number(m[9]) * 60 + Number(m[10])) : 0;
+    return { t: Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) - off * 60000,
+      jour: m[1] + '-' + m[2] + '-' + m[3], y: +m[1], mo: +m[2], d: +m[3], heure: m[4] + 'h' + m[5], off: off };
+  }
+  function jourCinema(off, plus) {
+    var d = new Date(maint() + off * 60000 + (plus || 0) * 86400000);
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+  }
+  var JOURS = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
+  var MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+  function nomJour(s) {
+    if (s.jour === jourCinema(s.off, 0)) return 'Aujourd’hui';
+    if (s.jour === jourCinema(s.off, 1)) return 'Demain';
+    return JOURS[new Date(Date.UTC(s.y, s.mo - 1, s.d)).getUTCDay()] + ' ' + s.d + ' ' + MOIS[s.mo - 1];
+  }
+  function duree(m) { m = Number(m); return m ? Math.floor(m / 60) + 'h' + pad(m % 60) : ''; }
+  function aVenir(liste) {
+    var now = maint();
+    return (liste || []).map(function (x) { var l = lire(x.debut); if (l) { l.version = x.version; l.titre = x.titre; l.salle = x.salle; } return l; })
+      .filter(function (l) { return l && l.t > now - 5 * 60000; })
+      .sort(function (a, b) { return a.t - b.t; });
+  }
+
+  // ---------- Programmation : même règle que Playlists.programme (serveur/playlists.js), à l'heure de l'écran
+  function programme(el, d) {
+    if (el.actif === false) return false;
+    var jour = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    if (el.dateDebut && jour < el.dateDebut) return false;
+    if (el.dateFin && jour > el.dateFin) return false;
+    if (el.jours && el.jours.length && el.jours.indexOf(d.getDay() || 7) < 0) return false;
+    if (el.heureDebut || el.heureFin) {
+      var h = pad(d.getHours()) + ':' + pad(d.getMinutes()), a = el.heureDebut || '00:00', b = el.heureFin || '24:00';
+      if (a <= b ? (h < a || h >= b) : (h < a && h >= b)) return false;
+    }
+    return true;
+  }
+  // Un élément « film » sans séance à venir, ou un tableau vide, est sauté
+  function jouable(el) {
+    if (!programme(el, new Date(maint()))) return false;
+    if (el.type === 'film' || el.type === 'seances') return aVenir(el.seances).length > 0;
+    if (el.type === 'semaine') return (el.films || []).some(function (f) { return aVenir(f.seances).length > 0; });
+    if (el.type === 'image' || el.type === 'video') return !!el.media;
+    return el.type === 'demo';
+  }
+
+  // ---------- Données : dernière version connue gardée en mémoire et dans le navigateur (survit à un redémarrage)
+  var CLE = 'playlist-' + nom, liste = [], prochaine = null;
+  try { var memo = JSON.parse(localStorage.getItem(CLE) || 'null'); if (memo && memo.length) liste = memo; } catch (e) {}
+  var DEMO = [
+    { type: 'demo', duree: 6, titre: 'Menu Ciné', texte: 'Pop-corn moyen + boisson 50 cl · 9,50 €', fond: '#FF8A2B', encre: '#401D00' },
+    { type: 'demo', duree: 6, titre: 'Glaces', texte: 'Cornets, bâtonnets et pots · dès 3 €', fond: '#16D6C4', encre: '#05332F' },
+    { type: 'demo', duree: 6, titre: 'Carte cinéma', texte: '10 places à 75 € · valable 1 an', fond: '#FF1F45', encre: '#FFFFFF' }
+  ];
+  function charger() {
+    // Aperçu dans l'admin : la page parente fournit la playlist en cours d'édition
+    try { if (window.parent && window.parent !== window && window.parent.__demoPlaylist) { prochaine = window.parent.__demoPlaylist(nom) || []; return; } } catch (e) {}
+    if (demo) { prochaine = DEMO; if (enAttente) suivant(); return; }
+    if (!nom) return;
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', config.source + '?t=' + Date.now());
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) return;
+      if (xhr.status !== 200 && !(xhr.status === 0 && xhr.responseText)) return;   // échec : on garde la playlist connue
+      try {
+        var d = JSON.parse(xhr.responseText), el = d && (d.elements || (d.length != null ? d : null));
+        if (d && d.cinema && !params.cinema) choisirMarque(d.cinema);
+        if (el) { prochaine = el; try { localStorage.setItem(CLE, JSON.stringify(el)); } catch (e) {} if (enAttente) suivant(); }
+      } catch (e) {}
+    };
+    try { xhr.send(); } catch (e) {}
+  }
+
+  // ---------- Boucle : une nouvelle playlist ne s'applique qu'entre deux éléments, jamais au milieu d'une vidéo
+  var index = -1, minuteur = null, active = null, enAttente = false;
+  function suivant() {
+    clearTimeout(minuteur);
+    if (prochaine) {
+      if (JSON.stringify(prochaine) !== JSON.stringify(liste)) { liste = prochaine; index = -1; }
+      prochaine = null;
+    }
+    for (var n = 0; n < liste.length; n++) {
+      index = (index + 1) % liste.length;
+      if (jouable(liste[index])) { enAttente = false; montrer(liste[index]); return; }
+    }
+    attente();
+    minuteur = setTimeout(suivant, 30000);
+  }
+
+  function couche(html, noir) {
+    var c = document.createElement('div');
+    c.className = 'couche' + (noir ? ' noir' : '');
+    c.innerHTML = html || '';
+    $('scene').appendChild(c);
+    setTimeout(function () { c.className += ' visible'; }, 30);
+    var ancienne = active; active = c;
+    if (ancienne) setTimeout(function () { if (ancienne.parentNode) ancienne.parentNode.removeChild(ancienne); }, 900);
+    return c;
+  }
+  // Pas de bandeau en pied d'écran (Vincent, 07/11) : le logo du cinéma est posé en filigrane
+  function bandeau() {
+    return '<img class="filigrane" src="' + MARQUES[marque].filigrane + '" alt="">';
+  }
+  function attente() {
+    if (enAttente) return;
+    enAttente = true;
+    couche('<div class="attente"><div><img src="' + LOGO + '" alt=""></div></div>', true);
+  }
+
+  function montrer(el) {
+    var ms = Math.max(2, Number(el.duree) || 10) * 1000;
+    if (el.type === 'video') return jouerVideo(el);
+    if (el.type === 'semaine') return semaine(el, ms);
+    if (el.type === 'image') {
+      var c = couche('', true), img = new Image();
+      img.className = 'media';
+      img.onload = function () { placer(img, 0, 0, SW, SH, false); c.appendChild(img); };
+      img.onerror = function () { clearTimeout(minuteur); minuteur = setTimeout(suivant, 500); };
+      img.src = el.media;
+    } else if (el.type === 'film') ficheFilm(el);
+    else if (el.type === 'seances') tableau(el);
+    else if (el.type === 'demo') couche('<div class="demo-visuel" style="background:' + esc(el.fond) + ';color:' + esc(el.encre) + '"><div><b>' + esc(el.titre) + '</b><span>' + esc(el.texte) + '</span></div></div>');
+    minuteur = setTimeout(suivant, ms);
+  }
+
+  // Image entière dans un cadre (x, y, l, h), centrée ; « proche » : remplit un cadre de même format à 4 % près
+  function placer(img, x, y, L, H, proche) {
+    var r = img.naturalWidth / img.naturalHeight, w, h;
+    if (proche && Math.abs(r - L / H) < 0.04) { w = L; h = H; }
+    else if (r > L / H) { w = L; h = Math.round(L / r); }
+    else { h = H; w = Math.round(H * r); }
+    img.style.width = w + 'px'; img.style.height = h + 'px';
+    img.style.left = Math.round(x + (L - w) / 2) + 'px'; img.style.top = Math.round(y + (H - h) / 2) + 'px';
+  }
+
+  function ficheFilm(el) {
+    var seances = aVenir(el.seances), jours = [], parJour = {};
+    seances.forEach(function (s) {
+      if (!parJour[s.jour]) { if (jours.length >= config.joursMax) return; parJour[s.jour] = []; jours.push(s.jour); }
+      parJour[s.jour].push(s);
+    });
+    var details = [];
+    if (el.dureeFilm) details.push('<span>Durée ' + duree(el.dureeFilm) + '</span>');
+    if (el.classification) details.push('<span class="badge">' + (/^\d+$/.test(el.classification) ? '-' + esc(el.classification) : esc(el.classification)) + '</span>');
+    var c = couche(
+      (FLOU && el.affiche ? '<div class="fond" style="background-image:url(\'' + esc(el.affiche).replace(/'/g, '') + '\')"></div>' : '') +
+      '<div class="voile"></div>' +
+      '<div class="affiche"><div class="placeholder"><span>' + esc(el.titre) + '</span></div></div>' +
+      '<div class="infos"><div class="centre"><div class="rubrique">À l’affiche</div><div class="filet"></div>' +
+        '<div class="titre">' + esc(el.titre) + '</div>' +
+        (details.length ? '<div class="details">' + details.join('') + '</div>' : '') +
+        '<div class="jours">' + jours.map(function (j) {
+          var l = parJour[j];
+          return '<div class="jour"><span class="lib">' + esc(nomJour(l[0])) + '</span><span class="heures">' +
+            l.map(function (s) { return '<span>' + s.heure + (s.version ? '<em>' + esc(s.version) + '</em>' : '') + '</span>'; }).join('') + '</span></div>';
+        }).join('') + '</div>' +
+      '</div></div>' + bandeau());
+    ajuster(c.getElementsByClassName('titre')[0], 2, 64);
+    if (el.affiche) {
+      var img = new Image();
+      img.onload = function () {
+        if (PORTRAIT) placer(img, 179, 66, 723, 1084, true); else placer(img, 31, 37, 670, 1005, true);
+        var a = c.getElementsByClassName('affiche')[0]; a.innerHTML = ''; a.appendChild(img);
+      };
+      img.src = el.affiche;   // en erreur : le cadre au titre reste
+    }
+  }
+
+  // Prochaines séances : une seule ligne par salle (sa séance immédiate), 5 lignes au plus, triées par heure.
+  // Voyant d'accès : vert « Salle ouverte » dès el.acces minutes avant la séance (10 par défaut),
+  // rouge « Patientez » avant, avec l'heure d'ouverture. Un tableau sans salles garde les 5 prochaines séances.
+  function tableau(el) {
+    var acces = el.acces != null && el.acces !== '' && !isNaN(el.acces) ? Number(el.acces) : 10, now = maint(), vues = {}, s = [];
+    aVenir(el.seances).forEach(function (x) {
+      var cle = x.salle != null && x.salle !== '' ? 'salle' + x.salle : 'seance' + s.length;
+      if (vues[cle] || s.length >= 5) return;
+      vues[cle] = true; s.push(x);
+    });
+    var salles = s.some(function (x) { return x.salle != null && x.salle !== ''; });
+    var c = couche('<div class="tableau"><div class="rubrique">Prochaines séances</div><div class="filet"></div>' +
+      '<div class="entetes"><span class="v">Accès</span><span class="h">Heure</span>' + (salles ? '<span class="s">Salle</span>' : '') + '<span>Film</span></div><div class="lignes">' +
+      s.map(function (x) {
+        var ouvert = now >= x.t - acces * 60000;
+        var hm = /(\d\d)h(\d\d)/.exec(x.heure), m = hm ? ((+hm[1] * 60 + +hm[2] - acces) % 1440 + 1440) % 1440 : 0;
+        return '<div class="ligne ' + (ouvert ? 'acces-ouvert' : 'acces-ferme') + '">' +
+          '<span class="v"><i></i><span>' + (ouvert ? 'Salle ouverte' : 'Patientez') + '<small>' + (ouvert ? 'Vous pouvez entrer' : 'Ouverture à ' + pad(Math.floor(m / 60)) + 'h' + pad(m % 60)) + '</small></span></span>' +
+          '<span class="h">' + x.heure + '</span>' +
+          (salles ? '<span class="s">' + (x.salle != null && x.salle !== '' ? '<b>' + esc(x.salle) + '</b>' : '') + '</span>' : '') +
+          '<span class="t">' + esc(x.titre) + '</span>' + (x.version ? '<em>' + esc(x.version) + '</em>' : '') + '</div>';
+      }).join('') + '</div></div>' + bandeau());
+    // titre trop long : la police se réduit (jusqu'à 60 px) avant de tronquer
+    reduire(c.getElementsByClassName('t'), 72, PORTRAIT ? 44 : 52);
+  }
+
+  // Programme de la semaine. Jours comptés à l'heure du cinéma (décalage des séances), pas du fuseau de l'écran.
+  // Une page = 7 films, 2 lignes d'horaires au plus par case ; s'il y en a plus, les pages se partagent la durée de l'élément (8 s au moins chacune).
+  var FILMS_PAGE = 7, MOIS_COURTS = ['janv.', 'févr.', 'mars', 'avril', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'], JOURS_COURTS = ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'];
+  function semaine(el, ms) {
+    var now = maint(), films = [], off = null;
+    (el.films || []).forEach(function (f) {
+      var ss = (f.seances || []).map(function (x) { var l = lire(x.debut); if (l) l.version = x.version; return l; }).filter(Boolean);
+      if (ss.length && off === null) off = ss[0].off;
+      if (ss.some(function (l) { return l.t > now - 5 * 60000; })) films.push({ titre: f.titre, affiche: f.affiche, seances: ss });
+    });
+    if (off === null) off = 60;
+    var jours = [];
+    for (var j = 0; j < 7; j++) {
+      var d = new Date(maint() + off * 60000 + j * 86400000);
+      jours.push({ cle: d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()), dow: d.getUTCDay(), d: d.getUTCDate(), mo: d.getUTCMonth() });
+    }
+    // on garde les films qui ont au moins une séance dans ces 7 jours ; ordre alphabétique
+    films = films.filter(function (f) { return f.seances.some(function (l) { return l.jour >= jours[0].cle && l.jour <= jours[6].cle; }); })
+      .sort(function (a, b) { return a.titre.localeCompare ? a.titre.localeCompare(b.titre, 'fr') : (a.titre < b.titre ? -1 : 1); });
+    if (PORTRAIT) return semainePortrait(films, jours, now, ms);
+    var pages = Math.max(1, Math.ceil(films.length / FILMS_PAGE)), parPage = Math.max(8000, Math.round(ms / pages)), n = 0;
+    var titre = 'Du ' + JOURS[jours[0].dow].toLowerCase() + ' ' + jours[0].d + (jours[0].mo !== jours[6].mo ? ' ' + MOIS[jours[0].mo] : '') +
+      ' au ' + JOURS[jours[6].dow].toLowerCase() + ' ' + jours[6].d + ' ' + MOIS[jours[6].mo];
+    function page() {
+      var lot = films.slice(n * FILMS_PAGE, (n + 1) * FILMS_PAGE);
+      var html = '<div class="semaine"><div class="tete"><div class="rubrique">Programme de la semaine</div><div class="filet"></div><h1>' + esc(titre) + '</h1></div>' +
+        (pages > 1 ? '<div class="page">' + (n + 1) + ' / ' + pages + '</div>' : '') +
+        '<table class="grille"><colgroup><col style="width:453px">' + jours.map(function () { return '<col>'; }).join('') + '</colgroup>' +
+        '<tr><th class="film">Film</th>' + jours.map(function (jr, k) {
+          return '<th' + (k === 0 ? ' class="auj"' : '') + '>' + (k === 0 ? 'Aujourd’hui' : JOURS_COURTS[jr.dow]) + '<b>' + jr.d + (k === 0 || jr.d === 1 ? ' ' + MOIS_COURTS[jr.mo] : '') + '</b></th>';
+        }).join('') + '</tr>' +
+        lot.map(function (f) {
+          return '<tr><td class="film">' + (f.affiche ? '<img src="' + esc(f.affiche) + '" alt="">' : '') + '<span>' + esc(f.titre) + '</span></td>' +
+            jours.map(function (jr, k) {
+              var h = f.seances.filter(function (l) { return l.jour === jr.cle; }).sort(function (a, b) { return a.t - b.t; });
+              return '<td' + (k === 0 ? ' class="auj"' : '') + '><div class="c">' + h.map(function (l) {
+                return '<span class="h' + (l.t < now - 5 * 60000 ? ' passee' : '') + '">' + l.heure + (l.version ? '<i>' + esc(l.version) + '</i>' : '') + '</span>';
+              }).join(h.length > 2 ? '' : '<br>') + '</div></td>';
+            }).join('') + '</tr>';
+        }).join('') + '</table></div>' + bandeau();
+      var c = couche(html);
+      // titre long : la police se réduit (jusqu'à 32 px) avant de tronquer
+      var t = c.getElementsByTagName('td'), spans = [];
+      for (var i = 0; i < t.length; i++) if (t[i].className === 'film') spans.push(t[i].getElementsByTagName('span')[0]);
+      reduire(spans, 44, 32);
+      n++;
+      minuteur = setTimeout(n < pages ? page : suivant, parPage);
+    }
+    page();
+  }
+
+
+  // Programme de la semaine en portrait (Cosmo, 07/11 : la grille 7 jours était trop chargée).
+  // Une page par jour, d'aujourd'hui à J+6 : films du jour (alphabétique), 8 par page, avec leurs horaires.
+  // Les pages se partagent la durée de l'élément (6 s au moins chacune). Bandeau des 7 jours en repère.
+  var FILMS_PAGE_PORTRAIT = 8;
+  function semainePortrait(films, jours, now, ms) {
+    var pages = [];
+    jours.forEach(function (jr, k) {
+      var lot = [];
+      films.forEach(function (f) {
+        var h = f.seances.filter(function (l) { return l.jour === jr.cle; }).sort(function (a, b) { return a.t - b.t; });
+        if (h.length && (k > 0 || h.some(function (l) { return l.t > now - 5 * 60000; }))) lot.push({ titre: f.titre, affiche: f.affiche, h: h });
+      });
+      var parts = Math.ceil(lot.length / FILMS_PAGE_PORTRAIT);
+      for (var p = 0; p < parts; p++) pages.push({ k: k, lot: lot.slice(p * FILMS_PAGE_PORTRAIT, (p + 1) * FILMS_PAGE_PORTRAIT), p: p, parts: parts });
+    });
+    if (!pages.length) pages.push({ k: 0, lot: [], p: 0, parts: 1 });
+    var parPage = Math.max(6000, Math.round(ms / pages.length)), n = 0;
+    function page() {
+      var pg = pages[n], jr = jours[pg.k];
+      var titre = pg.k === 0 ? 'Aujourd’hui' : pg.k === 1 ? 'Demain' : JOURS[jr.dow] + ' ' + jr.d + ' ' + MOIS[jr.mo];
+      var c = couche('<div class="semp"><div class="rubrique">Programme de la semaine</div><div class="filet"></div><h1>' + esc(titre) + '</h1>' +
+        (pg.parts > 1 ? '<div class="page">' + (pg.p + 1) + ' / ' + pg.parts + '</div>' : '') +
+        '<div class="jours7">' + jours.map(function (j, k) {
+          return '<span' + (k === pg.k ? ' class="actif"' : '') + '>' + JOURS_COURTS[j.dow] + '<b>' + j.d + '</b></span>';
+        }).join('') + '</div>' +
+        (pg.lot.length ? '<div class="films">' + pg.lot.map(function (f) {
+          return '<div class="fl">' + (f.affiche ? '<img src="' + esc(f.affiche) + '" alt="">' : '<span class="vide"></span>') +
+            '<div class="ft">' + esc(f.titre) + '</div><div class="fh">' + f.h.map(function (l) {
+              return '<span' + (l.t < now - 5 * 60000 ? ' class="passee"' : '') + '>' + l.heure + (l.version ? '<i>' + esc(l.version) + '</i>' : '') + '</span>';
+            }).join('') + '</div></div>';
+        }).join('') + '</div>' : '<div class="rien">Pas de séance ce jour-là</div>') +
+        '</div>' + bandeau());
+      reduire(c.getElementsByClassName('ft'), 72, 44);
+      reduire(c.getElementsByTagName('h1'), 117, 72);
+      n++;
+      minuteur = setTimeout(n < pages.length ? page : suivant, parPage);
+    }
+    page();
+  }
+
+  // Réduit la police d'éléments d'une ligne qui débordent ; refait 1 s plus tard (police chargée entre-temps)
+  function reduire(els, max, min) {
+    function passe() {
+      for (var i = 0; i < els.length; i++) {
+        var e = els[i]; if (!e) continue;
+        var f = max; e.style.fontSize = f + 'px';
+        while (f > min && e.scrollWidth > e.offsetWidth + 1) { f -= 2; e.style.fontSize = f + 'px'; }
+      }
+    }
+    passe(); setTimeout(passe, 1000);
+  }
+
+  // Réduit la police du titre jusqu'à ce qu'il tienne en maxLignes, sans le couper
+  function ajuster(el, maxLignes, mini) {
+    if (!el) return;
+    var taille = 117;
+    el.style.fontSize = taille + 'px';
+    while (taille > mini && el.scrollHeight > Math.ceil(taille * 1.02 * maxLignes) + 4) { taille -= 4; el.style.fontSize = taille + 'px'; }
+  }
+
+  // ---------- Vidéo sans le son ; duree 0 = en entier, sinon coupée à duree ; sautée si erreur ou démarrage bloqué
+  var video = $('video'), minVideo = [];
+  video.muted = true;
+  function jouerVideo(el) {
+    // Aperçu de l'admin (?apercu=1) : aucune vidéo chargée, un simple carton de 4 s à la place
+    if (params.apercu === '1') {
+      couche('<div class="attente"><div style="color:#FFF;font-family:\'Pathway Gothic One\',Arial,sans-serif;font-size:72px;text-transform:uppercase;letter-spacing:.06em;text-align:center">&#9654; Vidéo' +
+        (el.titre ? '<br><span style="color:#FF8FB0">' + (el.bientot ? 'Bientôt · ' : '') + esc(el.titre) + '</span>' : '') + '</div></div>', true);
+      minuteur = setTimeout(suivant, 4000);
+      return;
+    }
+    var fini = false, demarre = false;
+    function fin() {
+      if (fini) return; fini = true;
+      while (minVideo.length) clearTimeout(minVideo.pop());
+      video.onended = video.onerror = video.onplaying = null;
+      try { video.pause(); video.removeAttribute('src'); video.load(); } catch (x) {}
+      $('video-zone').style.display = 'none';
+      suivant();
+    }
+    $('legende').innerHTML = el.titre ? (el.bientot ? '<b>Bientôt</b> · ' : '') + esc(el.titre) : '';
+    $('video-zone').style.display = 'block';
+    video.onended = fin; video.onerror = fin;
+    video.onplaying = function () {
+      if (demarre) return; demarre = true;
+      if (Number(el.duree) > 0) minVideo.push(setTimeout(fin, Number(el.duree) * 1000));   // coupée à la durée choisie
+    };
+    minVideo.push(setTimeout(function () { if (!demarre) fin(); }, config.videoDemarrageMax));
+    minVideo.push(setTimeout(fin, Number(el.duree) > 0 ? Number(el.duree) * 1000 + config.videoDemarrageMax : config.videoDureeMax));
+    try {
+      video.muted = true; video.volume = 0;
+      video.src = el.media; video.load();
+      var p = video.play();
+      if (p && p['catch']) p['catch'](function () { fin(); });
+    } catch (x) { fin(); }
+  }
+
+  charger();
+  setTimeout(suivant, liste.length ? 0 : 1500);   // démarre sur la playlist mémorisée, ou attend la première lecture
+  setInterval(charger, demo ? 1000 : config.relecture);
+  setInterval(function () { var d = new Date(); if (d.getHours() === 4 && d.getMinutes() === 0) location.reload(); }, 60 * 1000);
+})();
+</script>
+</body>
+</html>
